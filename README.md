@@ -17,3 +17,44 @@ It's also designed to be as easy to install and use as possible, regardless of y
 **LEGAL DISCLAIMER:** Use this program at your own risk. We believe running this program does not currently violate any laws or regulations in the United States. However, we are not responsible for civil or criminal liability resulting from the use of this software. If you are located outside of the US please consult with an attorney in your country to help you assess the legal risks of running this program.
 
 *Good Hunting!*
+
+---
+
+## Fork Workflow (localmain)
+
+This fork uses `localmain` as the stable branch for local builds with custom features.
+
+### Branch Structure
+
+```
+origin/main (EFForg upstream)
+    ↓ fetch/rebase
+localmain (stable local build)
+    ↓ rebase
+feature branches (research/*, feat/*)
+```
+
+### Sync localmain with upstream
+
+```bash
+git fetch origin
+git checkout localmain
+git rebase origin/main
+git push myfork localmain --force-with-lease
+```
+
+### Rebase feature branch onto localmain
+
+```bash
+git checkout <feature-branch>
+git rebase localmain
+git push myfork <feature-branch> --force-with-lease
+```
+
+### Merge feature into localmain
+
+```bash
+git checkout localmain
+git merge <feature-branch>
+git push myfork localmain
+```
