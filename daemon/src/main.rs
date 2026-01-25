@@ -37,9 +37,10 @@ use diag::{
     DiagDeviceCtrlMessage, delete_all_recordings, delete_recording, get_analysis_report,
     start_recording, stop_recording,
 };
-use log::{error, info};
+use log::{error, info, warn};
 use qmdl_store::RecordingStoreError;
 use rayhunter::Device;
+use rayhunter::diag_client::DiagClient;
 use rayhunter::diag_device::DiagDevice;
 use stats::get_log;
 use tokio::net::TcpListener;
@@ -210,25 +211,70 @@ async fn run_with_config(
 
     if !config.debug_mode {
         info!("Using configuration for device: {0:?}", config.device);
-        let mut dev = DiagDevice::new(&config.device)
-            .await
-            .map_err(RayhunterError::DiagInitError)?;
-        dev.config_logs()
-            .await
-            .map_err(RayhunterError::DiagInitError)?;
 
-        info!("Starting Diag Thread");
-        run_diag_read_thread(
-            &task_tracker,
-            dev,
-            diag_rx,
-            diag_tx.clone(),
-            ui_update_tx.clone(),
-            qmdl_store_lock.clone(),
-            analysis_tx.clone(),
-            config.analyzers.clone(),
-            notification_service.new_handler(),
-        );
+        // Try to connect to orbicd's DIAG socket first (multiplexed access)
+        // Fall back to direct /dev/diag access if socket not available
+        if DiagClient::default_socket_exists() {
+            info!("orbicd DIAG socket detected, using multiplexed access");
+            match DiagClient::connect().await {
+                Ok(client) => {
+                    info!("Connected to orbicd DIAG server");
+                    diag::run_diag_client_thread(
+                        &task_tracker,
+                        client,
+                        diag_rx,
+                        diag_tx.clone(),
+                        ui_update_tx.clone(),
+                        qmdl_store_lock.clone(),
+                        analysis_tx.clone(),
+                        config.analyzers.clone(),
+                        notification_service.new_handler(),
+                    );
+                }
+                Err(e) => {
+                    warn!("Failed to connect to orbicd: {}, falling back to direct access", e);
+                    // Fall through to direct access
+                    let mut dev = DiagDevice::new(&config.device)
+                        .await
+                        .map_err(RayhunterError::DiagInitError)?;
+                    dev.config_logs()
+                        .await
+                        .map_err(RayhunterError::DiagInitError)?;
+                    run_diag_read_thread(
+                        &task_tracker,
+                        dev,
+                        diag_rx,
+                        diag_tx.clone(),
+                        ui_update_tx.clone(),
+                        qmdl_store_lock.clone(),
+                        analysis_tx.clone(),
+                        config.analyzers.clone(),
+                        notification_service.new_handler(),
+                    );
+                }
+            }
+        } else {
+            info!("Using direct /dev/diag access (orbicd socket not found)");
+            let mut dev = DiagDevice::new(&config.device)
+                .await
+                .map_err(RayhunterError::DiagInitError)?;
+            dev.config_logs()
+                .await
+                .map_err(RayhunterError::DiagInitError)?;
+
+            info!("Starting Diag Thread");
+            run_diag_read_thread(
+                &task_tracker,
+                dev,
+                diag_rx,
+                diag_tx.clone(),
+                ui_update_tx.clone(),
+                qmdl_store_lock.clone(),
+                analysis_tx.clone(),
+                config.analyzers.clone(),
+                notification_service.new_handler(),
+            );
+        }
         info!("Starting UI");
 
         let update_ui = match &config.device {

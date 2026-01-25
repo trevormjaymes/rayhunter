@@ -14,6 +14,10 @@ pub mod util;
 #[cfg(target_family = "unix")]
 pub mod diag_device;
 
+// DIAG client for connecting to orbicd multiplexer
+#[cfg(target_family = "unix")]
+pub mod diag_client;
+
 // re-export telcom_parser, since we use its types in our API
 pub use telcom_parser;
 

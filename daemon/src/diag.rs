@@ -19,6 +19,7 @@ use tokio_util::task::TaskTracker;
 
 use rayhunter::analysis::analyzer::{AnalysisLineNormalizer, AnalyzerConfig, EventType};
 use rayhunter::diag::{DataType, MessagesContainer};
+use rayhunter::diag_client::{DiagClient, DiagClientError};
 use rayhunter::diag_device::DiagDevice;
 use rayhunter::qmdl::QmdlWriter;
 
@@ -295,6 +296,94 @@ pub fn run_diag_read_thread(
                         Err(err) => {
                             error!("error reading diag device: {err}");
                             return Err(err);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Run the DIAG read thread using DiagClient (connected to orbicd)
+#[allow(clippy::too_many_arguments)]
+pub fn run_diag_client_thread(
+    task_tracker: &TaskTracker,
+    mut client: DiagClient,
+    mut qmdl_file_rx: Receiver<DiagDeviceCtrlMessage>,
+    qmdl_file_tx: Sender<DiagDeviceCtrlMessage>,
+    ui_update_sender: Sender<display::DisplayState>,
+    qmdl_store_lock: Arc<RwLock<RecordingStore>>,
+    analysis_sender: Sender<AnalysisCtrlMessage>,
+    analyzer_config: AnalyzerConfig,
+    notification_channel: tokio::sync::mpsc::Sender<Notification>,
+) {
+    task_tracker.spawn(async move {
+        // Subscribe to DIAG data from orbicd
+        if let Err(e) = client.subscribe("rayhunter").await {
+            error!("Failed to subscribe to DIAG data: {}", e);
+            return Err(rayhunter::diag_device::DiagDeviceError::InitializationFailed(
+                format!("DiagClient subscribe failed: {}", e)
+            ));
+        }
+
+        let mut diag_stream = pin!(client.as_stream().into_stream());
+        let mut diag_task = DiagTask::new(ui_update_sender, analysis_sender, analyzer_config, notification_channel);
+        qmdl_file_tx
+            .send(DiagDeviceCtrlMessage::StartRecording)
+            .await
+            .unwrap();
+        loop {
+            tokio::select! {
+                msg = qmdl_file_rx.recv() => {
+                    match msg {
+                        Some(DiagDeviceCtrlMessage::StartRecording) => {
+                            let mut qmdl_store = qmdl_store_lock.write().await;
+                            diag_task.start(qmdl_store.deref_mut()).await;
+                        },
+                        Some(DiagDeviceCtrlMessage::StopRecording) => {
+                            let mut qmdl_store = qmdl_store_lock.write().await;
+                            diag_task.stop(qmdl_store.deref_mut()).await;
+                        },
+                        Some(DiagDeviceCtrlMessage::Exit) | None => {
+                            info!("Diag client thread exiting...");
+                            diag_task.stop_current_recording().await;
+                            return Ok(())
+                        },
+                        Some(DiagDeviceCtrlMessage::DeleteEntry { name, response_tx }) => {
+                            let mut qmdl_store = qmdl_store_lock.write().await;
+                            let resp = diag_task.delete_entry(qmdl_store.deref_mut(), name.as_str()).await;
+                            if response_tx.send(resp).is_err() {
+                                error!("Failed to send delete entry response, receiver dropped");
+                            }
+                        },
+                        Some(DiagDeviceCtrlMessage::DeleteAllEntries { response_tx }) => {
+                            let mut qmdl_store = qmdl_store_lock.write().await;
+                            let resp = diag_task.delete_all_entries(qmdl_store.deref_mut()).await;
+                            if response_tx.send(resp).is_err() {
+                                error!("Failed to send delete all entries response, receiver dropped");
+                            }
+                        },
+                    }
+                }
+                maybe_container = diag_stream.next() => {
+                    match maybe_container {
+                        Some(Ok(container)) => {
+                            let mut qmdl_store = qmdl_store_lock.write().await;
+                            diag_task.process_container(qmdl_store.deref_mut(), container).await
+                        },
+                        Some(Err(DiagClientError::ConnectionClosed)) => {
+                            error!("DiagClient connection closed");
+                            return Err(rayhunter::diag_device::DiagDeviceError::InitializationFailed(
+                                "Connection to orbicd closed".to_string()
+                            ));
+                        },
+                        Some(Err(err)) => {
+                            error!("Error reading from DiagClient: {err}");
+                            // Continue - might be a transient error
+                        },
+                        None => {
+                            info!("DiagClient stream ended");
+                            return Ok(());
                         }
                     }
                 }
