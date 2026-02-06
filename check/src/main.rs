@@ -1,3 +1,4 @@
+use async_compression::tokio::bufread::GzipDecoder;
 use clap::Parser;
 use futures::TryStreamExt;
 use log::{debug, error, info, warn};
@@ -11,6 +12,7 @@ use rayhunter::{
 };
 use std::{collections::HashMap, future, path::PathBuf, pin::pin};
 use tokio::fs::File;
+use tokio::io::{AsyncRead, BufReader};
 use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
@@ -110,21 +112,20 @@ async fn analyze_pcap(pcap_path: &str, show_skipped: bool) {
     report.print_summary(show_skipped);
 }
 
-async fn analyze_qmdl(qmdl_path: &str, show_skipped: bool) {
+async fn analyze_qmdl_from_reader<R: AsyncRead + Unpin>(
+    reader: R,
+    max_bytes: Option<usize>,
+    display_path: &str,
+    show_skipped: bool,
+) {
     let mut harness = Harness::new_with_config(&AnalyzerConfig::default());
-    let qmdl_file = &mut File::open(&qmdl_path).await.expect("failed to open file");
-    let file_size = qmdl_file
-        .metadata()
-        .await
-        .expect("failed to get QMDL file metadata")
-        .len();
-    let mut qmdl_reader = QmdlReader::new(qmdl_file, Some(file_size as usize));
+    let mut qmdl_reader = QmdlReader::new(reader, max_bytes);
     let mut qmdl_stream = pin!(
         qmdl_reader
             .as_stream()
             .try_filter(|container| future::ready(container.data_type == DataType::UserSpace))
     );
-    let mut report = Report::new(qmdl_path);
+    let mut report = Report::new(display_path);
     while let Some(container) = qmdl_stream
         .try_next()
         .await
@@ -137,14 +138,29 @@ async fn analyze_qmdl(qmdl_path: &str, show_skipped: bool) {
     report.print_summary(show_skipped);
 }
 
-async fn pcapify(qmdl_path: &PathBuf) {
-    let qmdl_file = &mut File::open(&qmdl_path)
+async fn analyze_qmdl(qmdl_path: &str, show_skipped: bool) {
+    let qmdl_file = &mut File::open(&qmdl_path).await.expect("failed to open file");
+    let file_size = qmdl_file
+        .metadata()
         .await
-        .expect("failed to open qmdl file");
-    let qmdl_file_size = qmdl_file.metadata().await.unwrap().len();
-    let mut qmdl_reader = QmdlReader::new(qmdl_file, Some(qmdl_file_size as usize));
-    let mut pcap_path = qmdl_path.clone();
-    pcap_path.set_extension("pcapng");
+        .expect("failed to get QMDL file metadata")
+        .len();
+    analyze_qmdl_from_reader(qmdl_file, Some(file_size as usize), qmdl_path, show_skipped).await;
+}
+
+async fn analyze_qmdl_gz(qmdl_path: &str, show_skipped: bool) {
+    let qmdl_file = File::open(&qmdl_path).await.expect("failed to open file");
+    let decoder = GzipDecoder::new(BufReader::new(qmdl_file));
+    // Use None for max_bytes - relies on EOF detection at gzip stream end
+    analyze_qmdl_from_reader(decoder, None, qmdl_path, show_skipped).await;
+}
+
+async fn pcapify_from_reader<R: AsyncRead + Unpin>(
+    reader: R,
+    max_bytes: Option<usize>,
+    pcap_path: &PathBuf,
+) {
+    let mut qmdl_reader = QmdlReader::new(reader, max_bytes);
     let pcap_file = &mut File::create(&pcap_path)
         .await
         .expect("failed to open pcap file");
@@ -165,6 +181,26 @@ async fn pcapify(qmdl_path: &PathBuf) {
         }
     }
     info!("wrote pcap to {:?}", &pcap_path);
+}
+
+async fn pcapify(qmdl_path: &PathBuf) {
+    let qmdl_file = &mut File::open(&qmdl_path)
+        .await
+        .expect("failed to open qmdl file");
+    let qmdl_file_size = qmdl_file.metadata().await.unwrap().len();
+    let mut pcap_path = qmdl_path.clone();
+    pcap_path.set_extension("pcapng");
+    pcapify_from_reader(qmdl_file, Some(qmdl_file_size as usize), &pcap_path).await;
+}
+
+async fn pcapify_gz(qmdl_path: &PathBuf) {
+    let qmdl_file = File::open(&qmdl_path)
+        .await
+        .expect("failed to open qmdl file");
+    let decoder = GzipDecoder::new(BufReader::new(qmdl_file));
+    let mut pcap_path = qmdl_path.clone();
+    pcap_path.set_extension("pcapng");
+    pcapify_from_reader(decoder, None, &pcap_path).await;
 }
 
 #[tokio::main]
@@ -199,7 +235,13 @@ async fn main() {
         let path_str = path.to_str().unwrap();
         // instead of relying on the QMDL extension, can we check if a file is
         // QMDL by inspecting the contents?
-        if name_str.ends_with(".qmdl") {
+        if name_str.ends_with(".qmdl.gz") {
+            info!("**** Beginning analysis of {name_str}");
+            analyze_qmdl_gz(path_str, args.show_skipped).await;
+            if args.pcapify {
+                pcapify_gz(&path.to_path_buf()).await;
+            }
+        } else if name_str.ends_with(".qmdl") {
             info!("**** Beginning analysis of {name_str}");
             analyze_qmdl(path_str, args.show_skipped).await;
             if args.pcapify {

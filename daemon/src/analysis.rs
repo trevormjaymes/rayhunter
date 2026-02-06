@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::{cmp, future, pin};
 
+use async_compression::tokio::bufread::GzipDecoder;
 use axum::Json;
 use axum::{
     extract::{Path, State},
@@ -13,7 +14,7 @@ use rayhunter::diag::{DataType, MessagesContainer};
 use rayhunter::qmdl::QmdlReader;
 use serde::Serialize;
 use tokio::fs::File;
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncRead, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{RwLock, RwLockWriteGuard};
 use tokio_util::task::TaskTracker;
@@ -130,11 +131,13 @@ async fn perform_analysis(
     analyzer_config: &AnalyzerConfig,
 ) -> Result<(), String> {
     info!("Opening QMDL and analysis file for {name}...");
-    let (analysis_file, qmdl_file) = {
+    let (analysis_file, qmdl_file, qmdl_size_bytes, compressed) = {
         let mut qmdl_store = qmdl_store_lock.write().await;
-        let (entry_index, _) = qmdl_store
+        let (entry_index, entry) = qmdl_store
             .entry_for_name(name)
             .ok_or(format!("failed to find QMDL store entry for {name}"))?;
+        let qmdl_size_bytes = entry.qmdl_size_bytes;
+        let compressed = entry.compressed;
         let analysis_file = qmdl_store
             .clear_and_open_entry_analysis(entry_index)
             .await
@@ -144,18 +147,18 @@ async fn perform_analysis(
             .await
             .map_err(|e| format!("{e:?}"))?;
 
-        (analysis_file, qmdl_file)
+        (analysis_file, qmdl_file, qmdl_size_bytes, compressed)
     };
 
     let mut analysis_writer = AnalysisWriter::new(analysis_file, analyzer_config)
         .await
         .map_err(|e| format!("{e:?}"))?;
-    let file_size = qmdl_file
-        .metadata()
-        .await
-        .expect("failed to get QMDL file metadata")
-        .len();
-    let mut qmdl_reader = QmdlReader::new(qmdl_file, Some(file_size as usize));
+    let qmdl_source: Box<dyn AsyncRead + Unpin + Send> = if compressed {
+        Box::new(GzipDecoder::new(BufReader::new(qmdl_file)))
+    } else {
+        Box::new(qmdl_file)
+    };
+    let mut qmdl_reader = QmdlReader::new(qmdl_source, Some(qmdl_size_bytes));
     let mut qmdl_stream = pin::pin!(
         qmdl_reader
             .as_stream()

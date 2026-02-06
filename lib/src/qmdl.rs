@@ -39,6 +39,18 @@ where
         }
         Ok(())
     }
+
+    /// Flush the underlying writer. On a GzipEncoder this triggers SYNC_FLUSH,
+    /// making all written data decompressible by concurrent readers.
+    pub async fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush().await
+    }
+
+    /// Shutdown the underlying writer. On a GzipEncoder this writes the gzip
+    /// trailer, finalizing the stream.
+    pub async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.writer.shutdown().await
+    }
 }
 
 pub struct QmdlReader<T>
@@ -91,6 +103,9 @@ where
 
         let mut buf = Vec::new();
         let bytes_read = self.reader.read_until(MESSAGE_TERMINATOR, &mut buf).await?;
+        if bytes_read == 0 {
+            return Ok(None);
+        }
         self.bytes_read += bytes_read;
 
         // Since QMDL is just a flat list of messages, we can't actually
@@ -235,6 +250,85 @@ mod test {
                 expected_container,
                 reader.get_next_messages_container().await.unwrap().unwrap()
             );
+        }
+        assert!(matches!(
+            reader.get_next_messages_container().await,
+            Ok(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_unbounded_reader_eof() {
+        // With max_bytes: None, the reader should stop at EOF instead of looping
+        let buf = get_test_message_bytes();
+        let mut reader = QmdlReader::new(Cursor::new(&buf), None);
+        let expected_messages = get_test_messages();
+        for message in &expected_messages {
+            let container = reader.get_next_messages_container().await.unwrap().unwrap();
+            assert_eq!(container.messages[0].data, message.data);
+        }
+        // Should return None at EOF
+        assert!(matches!(
+            reader.get_next_messages_container().await,
+            Ok(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_gzip_round_trip() {
+        use async_compression::tokio::write::GzipEncoder;
+        use async_compression::tokio::bufread::GzipDecoder;
+
+        // Write containers through GzipEncoder
+        let mut compressed_buf = Vec::new();
+        let mut encoder = GzipEncoder::new(&mut compressed_buf);
+        let mut writer = QmdlWriter::new(&mut encoder);
+        let expected_containers = get_test_containers();
+        let total_uncompressed: usize = expected_containers.iter()
+            .flat_map(|c| &c.messages)
+            .map(|m| m.data.len())
+            .sum();
+        for container in &expected_containers {
+            writer.write_container(container).await.unwrap();
+        }
+        writer.shutdown().await.unwrap();
+
+        // Read back through GzipDecoder using uncompressed size as max_bytes
+        let decoder = GzipDecoder::new(BufReader::new(Cursor::new(&compressed_buf)));
+        let mut reader = QmdlReader::new(decoder, Some(total_uncompressed));
+        let expected_messages = get_test_messages();
+        for message in &expected_messages {
+            let container = reader.get_next_messages_container().await.unwrap().unwrap();
+            assert_eq!(container.messages[0].data, message.data);
+        }
+        assert!(matches!(
+            reader.get_next_messages_container().await,
+            Ok(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_gzip_unbounded_read() {
+        use async_compression::tokio::write::GzipEncoder;
+        use async_compression::tokio::bufread::GzipDecoder;
+
+        // Write and finalize a gzip stream
+        let mut compressed_buf = Vec::new();
+        let mut encoder = GzipEncoder::new(&mut compressed_buf);
+        let mut writer = QmdlWriter::new(&mut encoder);
+        let expected_containers = get_test_containers();
+        for container in &expected_containers {
+            writer.write_container(container).await.unwrap();
+        }
+        writer.shutdown().await.unwrap();
+
+        // Read back with max_bytes: None - relies on EOF fix
+        let decoder = GzipDecoder::new(BufReader::new(Cursor::new(&compressed_buf)));
+        let mut reader = QmdlReader::new(decoder, None);
+        let expected_messages = get_test_messages();
+        for message in &expected_messages {
+            let container = reader.get_next_messages_container().await.unwrap().unwrap();
+            assert_eq!(container.messages[0].data, message.data);
         }
         assert!(matches!(
             reader.get_next_messages_container().await,
