@@ -1,6 +1,7 @@
 use crate::ServerState;
 
 use anyhow::Error;
+use async_compression::tokio::bufread::GzipDecoder;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -12,7 +13,7 @@ use rayhunter::gsmtap_parser;
 use rayhunter::pcap::GsmtapPcapWriter;
 use rayhunter::qmdl::QmdlReader;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, duplex};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader, duplex};
 use tokio_util::io::ReaderStream;
 
 // Streams a pcap file chunk-by-chunk to the client by reading the QMDL data
@@ -37,6 +38,7 @@ pub async fn get_pcap(
         ));
     }
     let qmdl_size_bytes = entry.qmdl_size_bytes;
+    let compressed = entry.compressed;
     let qmdl_file = qmdl_store
         .open_entry_qmdl(entry_index)
         .await
@@ -46,7 +48,13 @@ pub async fn get_pcap(
     let (reader, writer) = duplex(1024);
 
     tokio::spawn(async move {
-        if let Err(e) = generate_pcap_data(writer, qmdl_file, qmdl_size_bytes).await {
+        let result = if compressed {
+            let decoder = GzipDecoder::new(BufReader::new(qmdl_file));
+            generate_pcap_data(writer, decoder, qmdl_size_bytes).await
+        } else {
+            generate_pcap_data(writer, qmdl_file, qmdl_size_bytes).await
+        };
+        if let Err(e) = result {
             error!("failed to generate PCAP: {e:?}");
         }
     });

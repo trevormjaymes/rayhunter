@@ -3,11 +3,11 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_compression::tokio::write::GzipEncoder;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
-use axum::response::{IntoResponse, Response};
 use futures::{StreamExt, TryStreamExt, future};
 use log::{debug, error, info, warn};
 use tokio::fs::File;
@@ -16,6 +16,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, oneshot};
 use tokio_stream::wrappers::LinesStream;
 use tokio_util::task::TaskTracker;
+use axum::response::{IntoResponse, Response};
 
 use rayhunter::analysis::analyzer::{AnalysisLineNormalizer, AnalyzerConfig, EventType};
 use rayhunter::diag::{DataType, MessagesContainer};
@@ -53,7 +54,7 @@ pub struct DiagTask {
 
 enum DiagState {
     Recording {
-        qmdl_writer: QmdlWriter<File>,
+        qmdl_writer: QmdlWriter<GzipEncoder<File>>,
         analysis_writer: Box<AnalysisWriter>,
     },
     Stopped,
@@ -84,7 +85,7 @@ impl DiagTask {
             .await
             .expect("failed creating QMDL file entry");
         self.stop_current_recording().await;
-        let qmdl_writer = QmdlWriter::new(qmdl_file);
+        let qmdl_writer = QmdlWriter::new(GzipEncoder::new(qmdl_file));
         let analysis_writer = AnalysisWriter::new(analysis_file, &self.analyzer_config)
             .await
             .map(Box::new)
@@ -158,13 +159,16 @@ impl DiagTask {
         let mut state = DiagState::Stopped;
         std::mem::swap(&mut self.state, &mut state);
         if let DiagState::Recording {
-            analysis_writer, ..
+            mut qmdl_writer,
+            analysis_writer,
         } = state
         {
-            analysis_writer
-                .close()
-                .await
-                .expect("failed to close analysis writer");
+            if let Err(e) = qmdl_writer.shutdown().await {
+                error!("failed to shutdown QMDL writer: {e}");
+            }
+            if let Err(e) = analysis_writer.close().await {
+                error!("failed to close analysis writer: {e}");
+            }
         }
     }
 
@@ -188,6 +192,9 @@ impl DiagTask {
                 .write_container(&container)
                 .await
                 .expect("failed to write to QMDL writer");
+            if let Err(e) = qmdl_writer.flush().await {
+                error!("failed to flush QMDL writer: {e}");
+            }
             debug!(
                 "total QMDL bytes written: {}, updating manifest...",
                 qmdl_writer.total_written

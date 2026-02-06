@@ -1,4 +1,5 @@
 use anyhow::Error;
+use async_compression::tokio::bufread::GzipDecoder;
 use async_zip::Compression;
 use async_zip::ZipEntryBuilder;
 use async_zip::tokio::write::ZipFileWriter;
@@ -14,7 +15,7 @@ use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::fs::write;
-use tokio::io::{AsyncReadExt, copy, duplex};
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader, copy, duplex};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::Sender;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
@@ -49,6 +50,8 @@ pub async fn get_qmdl(
         StatusCode::NOT_FOUND,
         format!("couldn't find qmdl file with name {qmdl_idx}"),
     ))?;
+    let qmdl_size_bytes = entry.qmdl_size_bytes;
+    let compressed = entry.compressed;
     let qmdl_file = qmdl_store
         .open_entry_qmdl(entry_index)
         .await
@@ -58,12 +61,17 @@ pub async fn get_qmdl(
                 format!("error opening QMDL file: {err}"),
             )
         })?;
-    let limited_qmdl_file = qmdl_file.take(entry.qmdl_size_bytes as u64);
-    let qmdl_stream = ReaderStream::new(limited_qmdl_file);
+    // Decompress on-the-fly for compressed entries, transparent to clients
+    let qmdl_source: Box<dyn AsyncRead + Unpin + Send> = if compressed {
+        Box::new(GzipDecoder::new(BufReader::new(qmdl_file)).take(qmdl_size_bytes as u64))
+    } else {
+        Box::new(qmdl_file.take(qmdl_size_bytes as u64))
+    };
+    let qmdl_stream = ReaderStream::new(qmdl_source);
 
     let headers = [
         (CONTENT_TYPE, "application/octet-stream"),
-        (CONTENT_LENGTH, &entry.qmdl_size_bytes.to_string()),
+        (CONTENT_LENGTH, &qmdl_size_bytes.to_string()),
     ];
     let body = Body::from_stream(qmdl_stream);
     Ok((headers, body).into_response())
@@ -213,7 +221,7 @@ pub async fn get_zip(
     Path(entry_name): Path<String>,
 ) -> Result<Response, (StatusCode, String)> {
     let qmdl_idx = entry_name.trim_end_matches(".zip").to_owned();
-    let (entry_index, qmdl_size_bytes) = {
+    let (entry_index, qmdl_size_bytes, compressed) = {
         let qmdl_store = state.qmdl_store_lock.read().await;
         let (entry_index, entry) = qmdl_store.entry_for_name(&qmdl_idx).ok_or((
             StatusCode::NOT_FOUND,
@@ -227,7 +235,7 @@ pub async fn get_zip(
             ));
         }
 
-        (entry_index, entry.qmdl_size_bytes)
+        (entry_index, entry.qmdl_size_bytes, entry.compressed)
     };
 
     let qmdl_store_lock = state.qmdl_store_lock.clone();
@@ -238,7 +246,7 @@ pub async fn get_zip(
         let result: Result<(), Error> = async {
             let mut zip = ZipFileWriter::with_tokio(writer);
 
-            // Add QMDL file
+            // Add QMDL file (decompressed for client compatibility)
             {
                 let entry =
                     ZipEntryBuilder::new(format!("{qmdl_idx}.qmdl").into(), Compression::Stored);
@@ -247,15 +255,18 @@ pub async fn get_zip(
                 // once https://github.com/Majored/rs-async-zip/pull/160 is released.
                 let mut entry_writer = zip.write_entry_stream(entry).await?.compat_write();
 
-                let mut qmdl_file = {
+                let qmdl_file = {
                     let qmdl_store = qmdl_store_lock.read().await;
-                    qmdl_store
-                        .open_entry_qmdl(entry_index)
-                        .await?
-                        .take(qmdl_size_bytes as u64)
+                    qmdl_store.open_entry_qmdl(entry_index).await?
                 };
 
-                copy(&mut qmdl_file, &mut entry_writer).await?;
+                let mut qmdl_source: Box<dyn AsyncRead + Unpin + Send> = if compressed {
+                    Box::new(GzipDecoder::new(BufReader::new(qmdl_file)).take(qmdl_size_bytes as u64))
+                } else {
+                    Box::new(qmdl_file.take(qmdl_size_bytes as u64))
+                };
+
+                copy(&mut qmdl_source, &mut entry_writer).await?;
                 entry_writer.into_inner().close().await?;
             }
 
@@ -267,15 +278,17 @@ pub async fn get_zip(
 
                 let qmdl_file_for_pcap = {
                     let qmdl_store = qmdl_store_lock.read().await;
-                    qmdl_store
-                        .open_entry_qmdl(entry_index)
-                        .await?
-                        .take(qmdl_size_bytes as u64)
+                    qmdl_store.open_entry_qmdl(entry_index).await?
                 };
 
-                if let Err(e) =
-                    generate_pcap_data(&mut entry_writer, qmdl_file_for_pcap, qmdl_size_bytes).await
-                {
+                let pcap_result = if compressed {
+                    let decoder = GzipDecoder::new(BufReader::new(qmdl_file_for_pcap));
+                    generate_pcap_data(&mut entry_writer, decoder, qmdl_size_bytes).await
+                } else {
+                    generate_pcap_data(&mut entry_writer, qmdl_file_for_pcap.take(qmdl_size_bytes as u64), qmdl_size_bytes).await
+                };
+
+                if let Err(e) = pcap_result {
                     // if we fail to generate the PCAP file, we should still continue and give the
                     // user the QMDL.
                     error!("Failed to generate PCAP: {e:?}");
@@ -342,14 +355,18 @@ mod tests {
         store_lock: &Arc<RwLock<crate::qmdl_store::RecordingStore>>,
         test_data: &[u8],
     ) -> String {
+        use async_compression::tokio::write::GzipEncoder;
+        use tokio::io::AsyncWriteExt;
+
         let entry_name = {
             let mut store = store_lock.write().await;
-            let (mut qmdl_file, _analysis_file) = store.new_entry().await.unwrap();
+            let (qmdl_file, _analysis_file) = store.new_entry().await.unwrap();
 
             if !test_data.is_empty() {
-                use tokio::io::AsyncWriteExt;
-                qmdl_file.write_all(test_data).await.unwrap();
-                qmdl_file.flush().await.unwrap();
+                // Write gzip-compressed data since new entries are compressed
+                let mut encoder = GzipEncoder::new(qmdl_file);
+                encoder.write_all(test_data).await.unwrap();
+                encoder.shutdown().await.unwrap();
             }
 
             let current_entry = store.current_entry.unwrap();
