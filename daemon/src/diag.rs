@@ -78,6 +78,7 @@ impl DiagTask {
 
     /// Start recording
     async fn start(&mut self, qmdl_store: &mut RecordingStore) {
+        self.max_type_seen = EventType::Informational;
         let (qmdl_file, analysis_file) = qmdl_store
             .new_entry()
             .await

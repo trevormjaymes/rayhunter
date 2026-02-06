@@ -1,8 +1,10 @@
 use chrono::{DateTime, FixedOffset};
+use log::debug;
 use pcap_file_tokio::pcapng::blocks::enhanced_packet::EnhancedPacketBlock;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
+use crate::analysis::diagnostic::DiagnosticAnalyzer;
 use crate::gsmtap::{GsmtapHeader, GsmtapMessage, GsmtapType};
 use crate::util::RuntimeMetadata;
 use crate::{diag::MessagesContainer, gsmtap_parser};
@@ -18,19 +20,21 @@ use super::{
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AnalyzerConfig {
-    pub imsi_requested: bool,
+    pub diagnostic_analyzer: bool,
     pub connection_redirect_2g_downgrade: bool,
     pub lte_sib6_and_7_downgrade: bool,
     pub null_cipher: bool,
     pub nas_null_cipher: bool,
     pub incomplete_sib: bool,
     pub test_analyzer: bool,
+    pub imsi_requested: bool,
 }
 
 impl Default for AnalyzerConfig {
     fn default() -> Self {
         AnalyzerConfig {
             imsi_requested: true,
+            diagnostic_analyzer: true,
             connection_redirect_2g_downgrade: true,
             lte_sib6_and_7_downgrade: true,
             null_cipher: true,
@@ -327,7 +331,7 @@ impl Harness {
             harness.add_analyzer(Box::new(ConnectionRedirect2GDowngradeAnalyzer {}));
         }
         if analyzer_config.lte_sib6_and_7_downgrade {
-            harness.add_analyzer(Box::new(LteSib6And7DowngradeAnalyzer {}));
+            harness.add_analyzer(Box::new(LteSib6And7DowngradeAnalyzer::new()));
         }
         if analyzer_config.null_cipher {
             harness.add_analyzer(Box::new(NullCipherAnalyzer {}));
@@ -343,6 +347,10 @@ impl Harness {
 
         if analyzer_config.test_analyzer {
             harness.add_analyzer(Box::new(TestAnalyzer {}))
+        }
+
+        if analyzer_config.diagnostic_analyzer {
+            harness.add_analyzer(Box::new(DiagnosticAnalyzer {}));
         }
 
         harness
@@ -380,8 +388,12 @@ impl Harness {
         row.events = match InformationElement::try_from(&gsmtap_message) {
             Ok(element) => self.analyze_information_element(&element),
             Err(err) => {
-                row.skipped_message_reason =
-                    Some(format!("failed to convert gsmtap message to IE: {err:?}"));
+                let msg = format!(
+                    "in packet {}, failed to convert gsmtap message to IE: {err:?}",
+                    self.packet_num
+                );
+                debug!("{msg}");
+                row.skipped_message_reason = Some(msg);
                 return row;
             }
         };
