@@ -6,7 +6,8 @@ It is also sometimes sold under the brand Kajeet RC400L. This is the exact same 
 
 You can buy an Orbic [using bezos
 bucks](https://www.amazon.com/Orbic-Verizon-Hotspot-Connect-Enabled/dp/B08N3CHC4Y),
-or on [eBay](https://www.ebay.com/sch/i.html?_nkw=orbic+rc400l).
+or on [eBay](https://www.ebay.com/sch/i.html?_nkw=orbic+rc400l). You should not
+pay more than 30 USD for such a device (without shipping).
 
 [Please check whether the Orbic works in your country](https://www.frequencycheck.com/countries/), and whether the Orbic RC400L supports the right frequency bands for your purpose before buying.
 
@@ -37,6 +38,7 @@ The orbic's installation routine underwent many different changes:
 It's possible that many tutorials out there still refer to some of the old
 installation routines.
 
+<a name=shell></a>
 ## Obtaining a shell
 
 After running the installer, there will not be a rootshell and ADB will not be

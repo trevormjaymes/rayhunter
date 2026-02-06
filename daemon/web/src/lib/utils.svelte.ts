@@ -10,6 +10,7 @@ export interface AnalyzerConfig {
     nas_null_cipher: boolean;
     incomplete_sib: boolean;
     test_analyzer: boolean;
+    diagnostic_analyzer: boolean;
 }
 
 export enum enabled_notifications {
@@ -26,15 +27,18 @@ export interface Config {
     analyzers: AnalyzerConfig;
 }
 
-export async function req(method: string, url: string): Promise<string> {
-    const response = await fetch(url, {
-        method: method,
-    });
-    const body = await response.text();
+export async function req(method: string, url: string, json_body?: unknown): Promise<string> {
+    const options: RequestInit = { method };
+    if (json_body !== undefined) {
+        options.body = JSON.stringify(json_body);
+        options.headers = { 'Content-Type': 'application/json' };
+    }
+    const response = await fetch(url, options);
+    const responseBody = await response.text();
     if (response.status >= 200 && response.status < 300) {
-        return body;
+        return responseBody;
     } else {
-        throw new Error(body);
+        throw new Error(responseBody);
     }
 }
 
@@ -42,13 +46,13 @@ export async function req(method: string, url: string): Promise<string> {
 export async function user_action_req(
     method: string,
     url: string,
-    error_msg: string
+    error_msg: string,
+    json_body?: unknown
 ): Promise<string | undefined> {
     try {
-        return await req(method, url);
+        return await req(method, url, json_body);
     } catch (error) {
         if (error instanceof Error) {
-            console.log('beeeo');
             add_error(error, error_msg);
         }
         return undefined;
@@ -96,4 +100,14 @@ export async function test_notification(): Promise<void> {
         const error = await response.text();
         throw new Error(error);
     }
+}
+
+export interface TimeResponse {
+    system_time: string;
+    adjusted_time: string;
+    offset_seconds: number;
+}
+
+export async function get_daemon_time(): Promise<TimeResponse> {
+    return JSON.parse(await req('GET', '/api/time'));
 }

@@ -12,6 +12,7 @@
         onclick,
         ariaLabel,
         errorMessage,
+        jsonBody,
     }: {
         url: string;
         method?: string;
@@ -23,6 +24,7 @@
         onclick?: () => void | Promise<void>;
         ariaLabel?: string;
         errorMessage?: string;
+        jsonBody?: unknown;
     } = $props();
 
     let is_requesting = $state(false);
@@ -43,7 +45,7 @@
         },
     };
 
-    async function handleClick() {
+    async function handle_click() {
         if (is_disabled) return;
 
         is_requesting = true;
@@ -51,7 +53,8 @@
             await user_action_req(
                 method,
                 url,
-                errorMessage ? errorMessage : 'Error performing action'
+                errorMessage ? errorMessage : 'Error performing action',
+                jsonBody
             );
             if (onclick) {
                 await onclick();
@@ -71,7 +74,7 @@
 
 <button
     class="text-white font-bold py-2 px-2 sm:px-4 rounded-md flex flex-row items-center gap-1 {buttonClasses}"
-    onclick={handleClick}
+    onclick={handle_click}
     disabled={is_disabled}
     aria-label={ariaLabel || label}
 >

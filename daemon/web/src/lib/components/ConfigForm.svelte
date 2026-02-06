@@ -12,7 +12,7 @@
     let testMessageType = $state<'success' | 'error' | null>(null);
     let showConfig = $state(false);
 
-    async function loadConfig() {
+    async function load_config() {
         try {
             loading = true;
             config = await get_config();
@@ -26,7 +26,7 @@
         }
     }
 
-    async function saveConfig() {
+    async function save_config() {
         if (!config) return;
 
         try {
@@ -43,7 +43,7 @@
         }
     }
 
-    async function sendTestNotification() {
+    async function send_test_notification() {
         try {
             testingNotification = true;
             testMessage = '';
@@ -61,7 +61,7 @@
 
     $effect(() => {
         if (showConfig && !config) {
-            loadConfig();
+            load_config();
         }
     });
 </script>
@@ -91,7 +91,7 @@
                 class="space-y-4"
                 onsubmit={(e) => {
                     e.preventDefault();
-                    saveConfig();
+                    save_config();
                 }}
             >
                 <div>
@@ -107,7 +107,12 @@
                         <option value={1}>1 - Subtle mode (colored line)</option>
                         <option value={2}>2 - Demo mode (orca gif)</option>
                         <option value={3}>3 - EFF logo</option>
+                        <option value={4}>4 - High visibility (full screen color)</option>
                     </select>
+                    <p class="text-xs text-gray-500 mt-1">
+                        Note: Rayhunter draws over the device's native UI, so some flickering is
+                        expected
+                    </p>
                 </div>
 
                 <div>
@@ -164,7 +169,7 @@
                     <div>
                         <button
                             type="button"
-                            onclick={sendTestNotification}
+                            onclick={send_test_notification}
                             disabled={testingNotification}
                             class="bg-rayhunter-blue hover:bg-rayhunter-dark-blue disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold py-2 px-4 rounded-md flex flex-row gap-1 items-center"
                         >
@@ -328,6 +333,20 @@
                             />
                             <label for="test_analyzer" class="ml-2 block text-sm text-gray-700">
                                 Test Heuristic (noisy!)
+                            </label>
+                        </div>
+                        <div class="flex items-center">
+                            <input
+                                id="diagnostic_analyzer"
+                                type="checkbox"
+                                bind:checked={config.analyzers.diagnostic_analyzer}
+                                class="h-4 w-4 text-rayhunter-blue focus:ring-rayhunter-blue border-gray-300 rounded"
+                            />
+                            <label
+                                for="diagnostic_analyzer"
+                                class="ml-2 block text-sm text-gray-700"
+                            >
+                                Diagnostic Analyzer
                             </label>
                         </div>
                     </div>
